@@ -1,7 +1,8 @@
-"""End-to-end tests for the Azure-compatible batch synthesis service.
+"""Integration tests for the Azure-compatible batch synthesis service.
 
-Live tests hit the real Microsoft Edge TTS endpoint through edge-tts and
-are skipped automatically when the network is unavailable.
+These run the full HTTP + synthesis stack through the in-process test
+client. Live tests hit the real Microsoft Edge TTS endpoint through
+edge-tts and are skipped automatically when the network is unavailable.
 """
 
 import asyncio
@@ -10,9 +11,7 @@ import json
 import zipfile
 from pathlib import Path
 
-import httpx
 import pytest
-import pytest_asyncio
 import soundfile as sf
 from fastapi.testclient import TestClient
 
@@ -180,12 +179,14 @@ class TestAzureResponseShape:
         assert response.status_code == 400
 
     def test_missing_inputs(self, client):
+        # Azure answers a missing required field with 400 + error contract.
         response = client.put(
             f"{API}/shape-test-006",
             params=PARAMS,
             json={"inputKind": "SSML"},
         )
-        assert response.status_code == 422
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "BadRequest"
 
     def test_error_contract(self, client):
         response = client.get(f"{API}/does-not-exist", params=PARAMS)

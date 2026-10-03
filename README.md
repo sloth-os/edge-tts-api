@@ -168,8 +168,33 @@ Errors use the Azure contract:
 - Synthesis runs through Microsoft Edge's free read-aloud endpoint, so it is
   subject to that service's limits and availability.
 
+## CI/CD
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR to `main`:
+
+1. **Test matrix** — unit, integration, and e2e suites in parallel jobs. The
+   e2e job drives the service (as a real uvicorn subprocess) using the
+   official Microsoft batch-synthesis client pattern from
+   [Azure-Samples/cognitive-services-speech-sdk](https://github.com/Azure-Samples/cognitive-services-speech-sdk/blob/master/samples/batch-synthesis/python/synthesis.py)
+   (`requests` + `Ocp-Apim-Subscription-Key`), plus overlap checks against the
+   official `azure-cognitiveservices-speech` SDK.
+2. **Docker** — builds the image (tests run inside the build), smoke-tests it,
+   then builds and publishes a **multi-arch image (linux/amd64 + linux/arm64)**
+   to GHCR at `ghcr.io/sloth-os/edge-tts-api`, tagged by branch, SHA, semver,
+   and `latest` on the default branch.
+
+Run the Docker image locally:
+
+```bash
+docker build -t edge-tts-api .
+docker run -p 8000:8000 -v edge-tts-data:/data edge-tts-api
+curl http://127.0.0.1:8000/health
+```
+
 ## Development
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 36 tests; live ones hit the Edge service
+.venv/bin/pip install -r requirements.txt pytest requests
+.venv/bin/python -m pytest tests/unit tests/integration -q   # offline suites
+.venv/bin/python -m pytest tests/e2e -m e2e -q              # live server + Edge TTS
 ```

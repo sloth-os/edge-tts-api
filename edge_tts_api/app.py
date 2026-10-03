@@ -18,7 +18,15 @@ import re
 from typing import Any, Dict, List, Optional
 
 import numpy as np
-from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi import (
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 
 from . import audio, config, results as results_mod, store as store_mod, synth
@@ -82,6 +90,25 @@ async def _http_error_handler(_request: Request, exc: HTTPException) -> JSONResp
     if isinstance(detail, dict) and "code" in detail:
         return azure_error(exc.status_code, detail["code"], detail["message"])
     return azure_error(exc.status_code, "HTTPException", str(detail))
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Map pydantic validation failures onto the Azure error contract.
+
+    Azure answers a body missing required fields (e.g. inputs) with
+    HTTP 400 + {"error": {"code": "BadRequest", ...}}, not FastAPI's
+    default 422 detail list.
+    """
+    first = exc.errors()[0] if exc.errors() else {}
+    field = ".".join(str(part) for part in first.get("loc", []) if part != "body")
+    return azure_error(
+        400,
+        "BadRequest",
+        f"The {field or 'request body'} is invalid. {first.get('msg', '')}".strip(),
+    )
 
 
 # ---------------------------------------------------------------------------

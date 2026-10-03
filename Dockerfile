@@ -23,7 +23,7 @@ COPY pytest.ini .
 RUN pip install --no-cache-dir \
       --timeout 120 --retries 5 \
       --index-url ${PIP_INDEX_URL} \
-      pytest requests httpx \
+      pytest requests httpx2 \
     && python -m pytest tests/unit -q --no-header -p no:cacheprovider \
     && rm -rf tests pytest.ini
 

@@ -182,6 +182,11 @@ class TestSdkWebsocket:
             assert b.boundary_type == speechsdk.SpeechSynthesisBoundaryType.Word
             assert b.audio_offset >= 0
             assert b.duration.total_seconds() >= 0
+        # synthesis_completed is delivered on a callback thread that may
+        # lag the speak_text() return; give it a moment.
+        deadline = time.monotonic() + 5.0
+        while not completed and time.monotonic() < deadline:
+            time.sleep(0.05)
         assert completed
 
     def test_sequential_syntheses_on_one_config(self, server):

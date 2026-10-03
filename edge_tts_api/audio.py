@@ -73,6 +73,15 @@ def is_supported(fmt: str) -> bool:
     )
 
 
+def raw_samplerate(fmt: str) -> int:
+    """Samplerate of a raw-*/riff-* format string (24000 when unknown)."""
+    if fmt in _RAW_FORMATS:
+        return _RAW_FORMATS[fmt]
+    if fmt in _RIFF_FORMATS:
+        return _RIFF_FORMATS[fmt]
+    return 24000
+
+
 def default_extension(fmt: str) -> str:
     """Return the conventional file extension for an output format."""
     if fmt in _RIFF_FORMATS:

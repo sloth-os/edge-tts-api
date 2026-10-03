@@ -1,14 +1,18 @@
-"""Azure Batch Synthesis API compatible HTTP service backed by edge-tts.
+"""Azure Speech-compatible TTS service backed by edge-tts.
 
-Endpoints (mirroring the Azure Speech service, api-version 2024-04-01):
+Two API surfaces are exposed:
 
-- PUT    /texttospeech/batchsyntheses/{id}  create job (201)
-- GET    /texttospeech/batchsyntheses/{id}  get job
-- GET    /texttospeech/batchsyntheses       list jobs (skip/maxpagesize)
-- DELETE /texttospeech/batchsyntheses/{id}  delete job (204)
+1. The REST **text-to-speech API** (what the official Speech SDKs call
+   "the REST API"): POST an SSML document, receive audio bytes, plus the
+   voices/list route.
+2. The **SDK websocket protocol** at ``/tts/cognitiveservices/websocket/v1``
+   — the same protocol the official ``azure-cognitiveservices-speech``
+   SpeechSynthesizer speaks, so the SDK works against this service with
+   ``SpeechConfig(endpoint="ws://host:port/tts/cognitiveservices/websocket/v1")``
+   (or ``SpeechConfig(host="ws://host:port", ...)``).
 
-Job results are downloadable at ``outputs.result`` (an absolute URL built
-from the request's base URL, matching the Azure response shape).
+The earlier Azure Batch Synthesis API surface (PUT/GET/DELETE
+/texttospeech/batchsyntheses) is retained for compatibility.
 """
 
 import asyncio
@@ -25,11 +29,19 @@ from fastapi import (
     Query,
     Request,
     Response,
+    WebSocket,
 )
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response as FastAPIResponse
 
-from . import audio, config, results as results_mod, store as store_mod, synth
+from . import (
+    audio,
+    config,
+    results as results_mod,
+    sdk_synth,
+    store as store_mod,
+    synth,
+)
 from .schemas import (
     BatchSynthesisConfig,
     BatchSynthesisInput,
@@ -40,12 +52,13 @@ from .schemas import (
 logger = logging.getLogger("edge_tts_api")
 
 app = FastAPI(
-    title="edge-tts batch synthesis service",
+    title="edge-tts Azure-compatible TTS service",
     description=(
-        "Azure Speech Batch Synthesis API compatible service backed by "
-        "edge-tts (Microsoft Edge online TTS)."
+        "Azure Speech text-to-speech compatible service backed by edge-tts "
+        "(Microsoft Edge online TTS): REST TTS + voices/list, and the "
+        "official Speech SDK websocket protocol."
     ),
-    version="1.0.0",
+    version="2.0.0",
 )
 
 store = store_mod.JobStore()
@@ -633,3 +646,151 @@ async def get_result_file(
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Azure text-to-speech REST API (api-version-less, like the real service)
+# ---------------------------------------------------------------------------
+
+# X-Microsoft-OutputFormat values the REST endpoint accepts (same set the
+# websocket path negotiates, plus their riff equivalents which the REST API
+# must produce itself since there is no client to add headers).
+
+
+@app.get("/tts/cognitiveservices/voices/list")
+@app.get("/cognitiveservices/voices/list")
+async def list_voices_rest() -> FastAPIResponse:
+    """List voices in the Azure voices/list response shape."""
+    try:
+        voices = await synth.gather_voices()
+    except Exception as exc:  # noqa: BLE001 - upstream edge-tts failure
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "ServiceUnavailable",
+                "message": f"Failed to fetch the voice list: {exc}",
+            },
+        ) from exc
+    return JSONResponse(content=_azure_voices(voices))
+
+
+def _azure_voices(edge_voices: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Map the edge-tts voice list onto the Azure voices/list shape."""
+    out: List[Dict[str, Any]] = []
+    for voice in edge_voices:
+        friendly = voice.get("FriendlyName", "")
+        display = friendly.split(" Online")[0].replace("Microsoft ", "") or voice.get(
+            "ShortName", ""
+        )
+        entry = {
+            "Name": voice.get("Name", ""),
+            "DisplayName": display,
+            "LocalName": display,
+            "ShortName": voice.get("ShortName", ""),
+            "Gender": voice.get("Gender", "Unknown"),
+            "Locale": voice.get("Locale", ""),
+            "LocaleName": voice.get("LocaleName", ""),
+            "SampleRateHertz": "24000",
+            "VoiceType": "Neural",
+            "Status": voice.get("Status", "GA"),
+            "WordsPerMinute": "150",
+        }
+        # Optional detail fields when edge-tts exposes them.
+        voice_tag = voice.get("VoiceTag") or {}
+        content_categories = voice_tag.get("ContentCategories") or []
+        if content_categories:
+            entry["StyleList"] = []
+            entry["VoiceTag"] = {
+                "ContentCategories": content_categories,
+                "VoicePersonalities": voice_tag.get(
+                    "VoicePersonalities", []
+                ),
+            }
+        out.append(entry)
+    return out
+
+
+@app.post("/cognitiveservices/v1")
+async def text_to_speech_rest(
+    request: Request,
+    output_format: Optional[str] = Header(None, alias="X-Microsoft-OutputFormat"),
+    content_type: Optional[str] = Header(None),
+) -> FastAPIResponse:
+    """The classic REST text-to-speech endpoint: SSML in, audio out."""
+    if content_type and "ssml+xml" not in content_type:
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "code": "UnsupportedMediaType",
+                "message": (
+                    "The Content-Type must be application/ssml+xml. "
+                    f"Received: '{content_type}'."
+                ),
+            },
+        )
+    if not output_format:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "BadRequest",
+                "message": "The X-Microsoft-OutputFormat header is required.",
+            },
+        )
+    if output_format and not audio.is_supported(output_format):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "BadRequest",
+                "message": (
+                    f"The output format '{output_format}' is invalid or "
+                    "unsupported."
+                ),
+            },
+        )
+    ssml = (await request.body()).decode("utf-8", errors="replace")
+    if not ssml.strip():
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "BadRequest",
+                "message": "The request body must contain SSML.",
+            },
+        )
+
+    voice = synth.extract_voice_from_ssml(ssml)
+    try:
+        mp3, _, _ = await synth.synthesize_one(
+            ssml,
+            input_kind="SSML",
+            voice=voice or "",
+            prosody={},
+            word_boundary=False,
+            sentence_boundary=False,
+        )
+    except synth.SynthesisError as exc:
+        raise HTTPException(
+            status_code=400, detail={"code": exc.code, "message": exc.message}
+        ) from exc
+
+    encoded = audio.transcode(mp3, output_format)
+    media = "audio/wav" if output_format.startswith("riff-") else "audio/mpeg"
+    if output_format.startswith("raw-"):
+        media = "application/octet-stream"
+    return FastAPIResponse(content=encoded, media_type=media)
+
+
+# ---------------------------------------------------------------------------
+# Official Speech SDK websocket endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.websocket("/tts/cognitiveservices/websocket/v1")
+@app.websocket("/cognitiveservices/websocket/v1")
+async def sdk_websocket_endpoint(websocket: WebSocket) -> None:
+    """Serve the official Speech SDK synthesis protocol.
+
+    The ``/tts`` prefix form is what the SDK requests when configured with
+    ``endpoint=...``; the shorter path is what it derives from
+    ``host="ws://host:port"``.
+    """
+    await sdk_synth.handle_sdk_websocket(websocket)

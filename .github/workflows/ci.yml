@@ -32,6 +32,10 @@ jobs:
           # starlette's TestClient needs the httpx2 backend on recent versions.
           pip install httpx2
 
+      - name: Install official Speech SDK (e2e)
+        if: matrix.test-suite == 'e2e'
+        run: pip install azure-cognitiveservices-speech
+
       - name: Unit tests
         if: matrix.test-suite == 'unit'
         run: python -m pytest tests/unit -v

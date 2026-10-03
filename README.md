@@ -1,13 +1,33 @@
 # edge-tts-api
 
-An Azure Speech **Batch Synthesis API** compatible text-to-speech service backed by
+An Azure Speech **Text-to-Speech API** compatible service backed by
 [`edge-tts`](https://pypi.org/project/edge-tts/) (Microsoft Edge's online TTS service).
 
-If you have client code written for the Azure Speech
-[batch synthesis API](https://learn.microsoft.com/azure/ai-services/speech-service/batch-synthesis)
-(`PUT/GET/DELETE /texttospeech/batchsyntheses/{id}?api-version=2024-04-01`), you can
-point it at this service — same endpoints, same JSON request/response contract — and get
-synthesized speech from Edge's neural voices for free, without an Azure Speech resource.
+The primary surface is the Azure Text-to-Speech API, and the **official
+`azure-cognitiveservices-speech` SDK works against this service unmodified** —
+point `SpeechConfig` at it and `speak_text` / `speak_ssml` / `get_voices_async`
+just work:
+
+```python
+import azure.cognitiveservices.speech as speechsdk
+
+config = speechsdk.SpeechConfig(host="ws://127.0.0.1:8000", subscription="anything")
+config.set_speech_synthesis_output_format(
+    speechsdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
+)
+synthesizer = speechsdk.SpeechSynthesizer(speech_config=config)
+result = synthesizer.speak_text("The rainbow has seven colors.")
+```
+
+(Or with the explicit endpoint form:
+`SpeechConfig(endpoint="ws://127.0.0.1:8000/tts/cognitiveservices/websocket/v1", ...)`.)
+
+The REST TTS API is served too (`GET /cognitiveservices/voices/list`,
+`POST /cognitiveservices/v1`), and the legacy Azure **batch synthesis API**
+(`PUT/GET/DELETE /texttospeech/batchsyntheses/{id}?api-version=2024-04-01`)
+remains available — point existing batch clients at this service the same way,
+same endpoints, same JSON request/response contract — and get synthesized
+speech from Edge's neural voices for free, without an Azure Speech resource.
 
 ## Quick start
 
@@ -29,11 +49,89 @@ Configuration via environment variables:
 
 ## API
 
+### Official Speech SDK (websocket)
+
+The SDK's native synthesis protocol is served on both paths the SDK can
+reach:
+
+- `/tts/cognitiveservices/websocket/v1` — used by `SpeechConfig(endpoint=...)`
+- `/cognitiveservices/websocket/v1` — used by `SpeechConfig(host=...)`
+
+Supported: `speak_text` / `speak_ssml`, all Riff/Raw PCM and MP3 output
+formats (negotiated through `set_speech_synthesis_output_format`),
+word/sentence boundary events, `synthesis_started` / `synthesis_completed`
+events with audio duration, and `get_voices_async` (with optional locale
+filter). Unknown voices surface as `CancellationReason.Error` /
+`CancellationErrorCode.ServiceError`, as they do against Azure.
+
+```python
+import azure.cognitiveservices.speech as speechsdk
+
+config = speechsdk.SpeechConfig(host="ws://127.0.0.1:8000", subscription="anything")
+synthesizer = speechsdk.SpeechSynthesizer(speech_config=config)
+synthesizer.synthesis_word_boundary.connect(
+    lambda args: print(args.text, args.audio_offset, args.duration)
+)
+result = synthesizer.speak_ssml(
+    '<speak version="1.0" xml:lang="en-US">'
+    '<voice name="en-US-JennyNeural">'
+    '<prosody rate="+20%">Quick prosody test.</prosody>'
+    "</voice></speak>"
+)
+
+voices = synthesizer.get_voices_async().get()          # 300+ voices
+en_us = synthesizer.get_voices_async(locale="en-US").get()
+```
+
+### REST — list voices: `GET /cognitiveservices/voices/list`
+
+(Also served at `/tts/cognitiveservices/voices/list`.) Returns the Azure
+voice-list JSON:
+
+```json
+[
+  {
+    "Name": "Microsoft Server Speech Text to Speech Voice (en-US, JennyNeural)",
+    "DisplayName": "Jenny",
+    "LocalName": "Jenny",
+    "ShortName": "en-US-JennyNeural",
+    "Gender": "Female",
+    "Locale": "en-US",
+    "LocaleName": "English (United States)",
+    "SampleRateHertz": "24000",
+    "VoiceType": "Neural",
+    "Status": "GA",
+    "WordsPerMinute": "150",
+    "StyleList": [],
+    "VoiceTag": {"ContentCategories": [...], "VoicePersonalities": [...]}
+  }
+]
+```
+
+### REST — synthesize: `POST /cognitiveservices/v1`
+
+SSML in, audio bytes out — the classic Azure REST contract:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/cognitiveservices/v1" \
+  -H "Content-Type: application/ssml+xml" \
+  -H "X-Microsoft-OutputFormat: riff-24khz-16bit-mono-pcm" \
+  -H "Ocp-Apim-Subscription-Key: anything" \
+  -d '<speak version="1.0" xml:lang="en-US"><voice name="en-US-JennyNeural">The rainbow has seven colors.</voice></speak>' \
+  --output rainbow.wav
+```
+
+- `Content-Type` must contain `application/ssml+xml` (else `415`)
+- `X-Microsoft-OutputFormat` is required (else `400`); values are the same
+  format strings as below
+- The `<voice name="...">` in the SSML selects the Edge voice
+
+### Legacy batch synthesis API
+
 All four Azure batch synthesis operations are implemented. `api-version=2024-04-01`
 is the supported version.
 
 ### Create a job — `PUT /texttospeech/batchsyntheses/{id}`
-
 ```bash
 curl -X PUT "http://127.0.0.1:8000/texttospeech/batchsyntheses/my-job-001?api-version=2024-04-01" \
   -H "Content-Type: application/json" \
@@ -148,7 +246,12 @@ transcodes to the requested Azure format (numpy + soundfile, no ffmpeg needed):
 - `raw-{...}khz-16bit-mono-pcm` (`.pcm`)
 - `audio-{16,24,48}khz-{32..192}kbitrate-mono-mp3` (`.mp3`)
 
-Unrecognized formats are rejected with the Azure-style 400 error.
+Over the SDK websocket the Speech SDK requests Riff formats as the matching
+raw format and prepends the RIFF header itself; formats needing codecs the
+service does not carry (opus/webm/silk/g722/amr) fall back to the closest
+playable PCM rate.
+
+Unrecognized formats are rejected with the Azure-style 400 error (REST).
 
 ## Errors
 
@@ -174,10 +277,12 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR to `main`:
 
 1. **Test matrix** — unit, integration, and e2e suites in parallel jobs. The
    e2e job drives the service (as a real uvicorn subprocess) using the
-   official Microsoft batch-synthesis client pattern from
+   **official `azure-cognitiveservices-speech` SDK** end-to-end over the
+   websocket synthesis protocol (`speak_text`/`speak_ssml`, output formats,
+   word boundaries, voice enumeration), plus the official Microsoft
+   batch-synthesis client pattern from
    [Azure-Samples/cognitive-services-speech-sdk](https://github.com/Azure-Samples/cognitive-services-speech-sdk/blob/master/samples/batch-synthesis/python/synthesis.py)
-   (`requests` + `Ocp-Apim-Subscription-Key`), plus overlap checks against the
-   official `azure-cognitiveservices-speech` SDK.
+   (`requests` + `Ocp-Apim-Subscription-Key`) for the legacy surface.
 2. **Docker** — builds the image (tests run inside the build), smoke-tests it,
    then builds and publishes a **multi-arch image (linux/amd64 + linux/arm64)**
    to GHCR at `ghcr.io/sloth-os/edge-tts-api`, tagged by branch, SHA, semver,
@@ -194,7 +299,7 @@ curl http://127.0.0.1:8000/health
 ## Development
 
 ```bash
-.venv/bin/pip install -r requirements.txt pytest requests
+.venv/bin/pip install -r requirements.txt pytest requests azure-cognitiveservices-speech
 .venv/bin/python -m pytest tests/unit tests/integration -q   # offline suites
 .venv/bin/python -m pytest tests/e2e -m e2e -q              # live server + Edge TTS
 ```

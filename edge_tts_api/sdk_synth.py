@@ -45,6 +45,18 @@ _EDGE_NATIVE_RATE = 24000
 
 _VOICE_NAME_RE = re.compile(r"<voice\b[^>]*\bname\s*=\s*[\"']([^\"']+)[\"']", re.I)
 
+# Azure SSML named rate constants -> percentage (see "Adjust prosody":
+# x-slow 0.5, slow 0.64, medium 1, fast 1.55, x-fast 2).
+_NAMED_RATES = {
+    "x-slow": "-50%",
+    "slow": "-36%",
+    "medium": "+0%",
+    "fast": "+55%",
+    "x-fast": "+100%",
+}
+# A plain multiplier: "1", "1.25", "0.5" (an Azure-accepted rate form).
+_MULTIPLIER_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
+
 
 class SdkSynthesisError(Exception):
     """A synthesis failure that is reported to the client as turn error."""
@@ -88,11 +100,29 @@ def _extract_request(ssml: str) -> Tuple[str, Optional[Dict[str, str]]]:
 
 
 def _normalize_prosody(value: str) -> str:
-    """Coerce a prosody value to edge-tts's signed form."""
+    """Coerce an SSML prosody value to edge-tts's signed form.
+
+    Azure SSML accepts a plain multiplier (``rate="1.25"``), a bare
+    percentage (``rate="25%"``), a signed percentage (``+25%``/``-50%``),
+    and named constants (``x-slow``..``x-fast``); edge-tts only accepts a
+    signed percentage (rate/volume) or signed Hz (pitch). Multipliers and
+    named rates are converted to their percentage equivalent; percentages
+    gain the explicit ``+``.
+    """
     value = value.strip()
-    if value.startswith(("+", "-")):
-        return value
-    return f"+{value}"
+
+    if value in _NAMED_RATES:
+        value = _NAMED_RATES[value]
+
+    if value.endswith("%"):
+        number = value[:-1]
+        return f"-{number.lstrip('+-')}%" if number.startswith("-") else f"+{number.lstrip('+')}%"
+
+    if _MULTIPLIER_RE.fullmatch(value):
+        multiplier = float(value)
+        return f"{round((multiplier - 1) * 100):+d}%"
+
+    return value
 
 
 async def _synthesize(

@@ -36,6 +36,14 @@ jobs:
         if: matrix.test-suite == 'e2e'
         run: pip install azure-cognitiveservices-speech
 
+      - name: Build service image (mm-gateway e2e)
+        # The mm-gateway e2e runs this service as a container next to the
+        # real ghcr.io/sloth-os/mm-gateway:latest. The docker job below
+        # builds the same image for its smoke test; building it here too
+        # keeps the e2e suite self-contained on the test matrix.
+        if: matrix.test-suite == 'e2e'
+        run: docker build -t edge-tts-api:e2e .
+
       - name: Unit tests
         if: matrix.test-suite == 'unit'
         run: python -m pytest tests/unit -v
@@ -46,7 +54,15 @@ jobs:
 
       - name: E2E tests (official Azure client pattern)
         if: matrix.test-suite == 'e2e'
-        run: python -m pytest tests/e2e -m e2e -v
+        run: python -m pytest tests/e2e -m e2e -v --ignore=tests/e2e/test_mm_gateway.py
+
+      - name: E2E tests (real mm-gateway container)
+        # Drives the published sloth-os/mm-gateway image end to end:
+        # gateway REST -> official Speech SDK -> this service's websocket.
+        if: matrix.test-suite == 'e2e'
+        env:
+          EDGE_TTS_API_IMAGE: edge-tts-api:e2e
+        run: python -m pytest tests/e2e/test_mm_gateway.py -m e2e -v
 
   docker:
     name: Docker build & publish
